@@ -71,7 +71,7 @@ function connectGateIO(channels) {
         payload: channels
       }));
       console.log(`📡 Subscribed to: ${channels.join(', ')}`);
-    }, 500);
+    }, 1000);
   });
 
   gateWS.on('message', (data) => {

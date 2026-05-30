@@ -10,34 +10,29 @@ const REFRESH_INTERVAL_MS = 5 * 60_000; // refresh top pairs every 5 min
 const BROADCAST_INTERVAL_MS = 2000;   // push scores every 2 sec
 
 // ── STATE ────────────────────────────────────────────────────
-const whaleTrades = new Map();
-let topPairs = [];
+const whaleTrades = new Map();        // pair -> [{time, side, notional}]
+let topPairs = [];                    // e.g. ['BTCUSDT', 'ETHUSDT', …]
 let pairScores = new Map();
-let binanceWS = null;
-let currentStreamUrl = '';
+let bybitWS = null;
 
 // ── HELPERS ──────────────────────────────────────────────────
 
+/** Fetch top USDT spot pairs by 24h turnover from Bybit (public) */
 async function fetchTopPairs(n = TOP_N) {
   try {
-    const res = await fetch('https://api.binance.com/api/v3/ticker/24hr', {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-      }
-    });
-    const data = await res.json();
-
-    // 🚨 If not an array, log what we got
-    if (!Array.isArray(data)) {
-      console.error('❌ Binance returned non-array:', JSON.stringify(data).slice(0, 300));
+    const res = await fetch('https://api.bybit.com/v5/market/tickers?category=spot');
+    const json = await res.json();
+    if (json.retCode !== 0 || !json.result?.list) {
+      console.error('❌ Bybit ticker error:', json.retMsg);
       return [];
     }
-
-    const usdt = data
-      .filter(t => t.symbol && t.symbol.endsWith('USDT'))
-      .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
+    const all = json.result.list;
+    // Filter USDT pairs, sort by turnover (quote volume)
+    const usdt = all
+      .filter(t => t.symbol.endsWith('USDT'))
+      .sort((a, b) => parseFloat(b.turnover24h) - parseFloat(a.turnover24h))
       .slice(0, n)
-      .map(t => t.symbol);
+      .map(t => t.symbol);   // e.g. "BTCUSDT"
     return usdt;
   } catch (e) {
     console.error('❌ fetchTopPairs error:', e.message);
@@ -59,7 +54,7 @@ function computeScores() {
     const trades = whaleTrades.get(pair) || [];
     let buyVol = 0, sellVol = 0;
     for (let t of trades) {
-      if (t.side === 'buy') buyVol += t.notional;
+      if (t.side === 'Buy') buyVol += t.notional;
       else sellVol += t.notional;
     }
     const total = buyVol + sellVol;
@@ -68,63 +63,63 @@ function computeScores() {
   return scores;
 }
 
-function buildStreamUrl(pairs) {
-  const streams = pairs.map(s => `${s.toLowerCase()}@trade`).join('/');
-  return `wss://stream.binance.com:9443/stream?streams=${streams}`;
-}
+// ── BYBIT WEBSOCKET (public spot trades) ────────────────────
 
-// ── BINANCE WEBSOCKET ────────────────────────────────────────
-
-function connectBinanceStream(pairs) {
-  if (binanceWS) {
-    binanceWS.close(1000, 'Refreshing pairs');
-    binanceWS = null;
+function connectBybitStream(pairs) {
+  if (bybitWS) {
+    bybitWS.close(1000, 'Refreshing pairs');
+    bybitWS = null;
   }
 
-  currentStreamUrl = buildStreamUrl(pairs);
-  binanceWS = new WebSocket(currentStreamUrl);
+  bybitWS = new WebSocket('wss://stream.bybit.com/v5/public/spot');
 
-  binanceWS.on('open', () => {
-    console.log(`✅ Binance stream opened (${pairs.length} pairs)`);
+  bybitWS.on('open', () => {
+    console.log('✅ Bybit WS open. Subscribing to trades...');
+    // Subscribe to each pair's trade channel
+    const args = pairs.map(p => `publicTrade.${p}`);
+    bybitWS.send(JSON.stringify({ op: 'subscribe', args }));
+    console.log(`📡 Subscribed to: ${args.join(', ')}`);
   });
 
-  binanceWS.on('message', (data) => {
+  bybitWS.on('message', (data) => {
     try {
       const msg = JSON.parse(data);
-      if (msg.data) {
-        const trade = msg.data;
-        const pair = trade.s;
-        const price = parseFloat(trade.p);
-        const amount = parseFloat(trade.q);
-        const notional = price * amount;
-        const side = trade.m ? 'sell' : 'buy';
+      // Bybit trade message: { topic: "publicTrade.BTCUSDT", type: "snapshot"|"delta", data: [...] }
+      if (msg.topic && msg.topic.startsWith('publicTrade.') && msg.data) {
+        const pair = msg.topic.replace('publicTrade.', '');
+        const trades = msg.data;
+        for (let trade of trades) {
+          const price = parseFloat(trade.p);
+          const amount = parseFloat(trade.v);
+          const notional = price * amount;
+          // Bybit: S = "Buy" or "Sell" (aggressor side)
+          const side = trade.S;
 
-        if (notional >= WHALE_THRESHOLD) {
-          if (!whaleTrades.has(pair)) whaleTrades.set(pair, []);
-          whaleTrades.get(pair).push({
-            time: trade.E / 1000,
-            side,
-            notional,
-          });
+          if (notional >= WHALE_THRESHOLD) {
+            if (!whaleTrades.has(pair)) whaleTrades.set(pair, []);
+            whaleTrades.get(pair).push({
+              time: trade.T / 1000,   // trade time in ms → seconds
+              side,                    // "Buy" or "Sell"
+              notional,
+            });
+          }
         }
       }
     } catch (e) {}
   });
 
-  binanceWS.on('close', (code, reason) => {
-    console.log(`🔴 Binance disconnected – code: ${code}, reason: ${reason}`);
-    binanceWS = null;
+  bybitWS.on('close', (code, reason) => {
+    console.log(`🔴 Bybit disconnected – code: ${code}, reason: ${reason}`);
+    bybitWS = null;
     setTimeout(() => {
       if (topPairs.length > 0) {
-        console.log('🔄 Reconnecting to Binance…');
-        connectBinanceStream(topPairs);
+        console.log('🔄 Reconnecting to Bybit…');
+        connectBybitStream(topPairs);
       }
     }, 5000);
   });
 
-  binanceWS.on('error', (err) => {
-    console.error('🚨 Binance WS error:', err.message);
-  });
+  bybitWS.on('error', (err) => console.error('🚨 Bybit WS error:', err.message));
 }
 
 // ── DYNAMIC PAIR REFRESH ─────────────────────────────────────
@@ -136,12 +131,12 @@ async function refreshPairs() {
   }
 
   if (JSON.stringify(newPairs) !== JSON.stringify(topPairs)) {
-    console.log('🔄 Top pairs changed. Updating Binance stream…');
+    console.log('🔄 Top pairs changed. Updating Bybit stream…');
     for (let pair of whaleTrades.keys()) {
       if (!newPairs.includes(pair)) whaleTrades.delete(pair);
     }
     topPairs = newPairs;
-    connectBinanceStream(topPairs);
+    connectBybitStream(topPairs);
   } else {
     topPairs = newPairs;
   }
@@ -182,13 +177,12 @@ async function initPairs() {
     attempts++;
   }
   if (pairs.length === 0) {
-    console.error('❌ Failed to get pairs after 10 attempts. Starting with empty list, will retry in background.');
-    // Don't exit – the refresh interval will eventually get pairs.
+    console.error('❌ Could not get pairs after 10 attempts. Retrying in background.');
     return;
   }
   topPairs = pairs;
   console.log('🏆 Top pairs:', topPairs.join(', '));
-  connectBinanceStream(topPairs);
+  connectBybitStream(topPairs);
 }
 
 initPairs();

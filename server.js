@@ -10,25 +10,34 @@ const REFRESH_INTERVAL_MS = 5 * 60_000; // refresh top pairs every 5 min
 const BROADCAST_INTERVAL_MS = 2000;   // push scores every 2 sec
 
 // ── STATE ────────────────────────────────────────────────────
-const whaleTrades = new Map();        // pair -> [{time, side, notional}]
-let topPairs = [];                    // e.g. ['BTCUSDT', 'ETHUSDT', …]   ← Binance format (no slash)
+const whaleTrades = new Map();
+let topPairs = [];
 let pairScores = new Map();
-let binanceWS = null;                 // connection to Binance
+let binanceWS = null;
 let currentStreamUrl = '';
 
 // ── HELPERS ──────────────────────────────────────────────────
 
-/** Fetch top USDT pairs by 24h volume from Binance (no API key). */
 async function fetchTopPairs(n = TOP_N) {
   try {
-    const res = await fetch('https://api.binance.com/api/v3/ticker/24hr');
-    const tickers = await res.json();
-    // Filter only USDT pairs, sort by quote volume descending
-    const usdt = tickers
-      .filter(t => t.symbol.endsWith('USDT'))
+    const res = await fetch('https://api.binance.com/api/v3/ticker/24hr', {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+      }
+    });
+    const data = await res.json();
+
+    // 🚨 If not an array, log what we got
+    if (!Array.isArray(data)) {
+      console.error('❌ Binance returned non-array:', JSON.stringify(data).slice(0, 300));
+      return [];
+    }
+
+    const usdt = data
+      .filter(t => t.symbol && t.symbol.endsWith('USDT'))
       .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
       .slice(0, n)
-      .map(t => t.symbol);   // e.g. 'BTCUSDT'
+      .map(t => t.symbol);
     return usdt;
   } catch (e) {
     console.error('❌ fetchTopPairs error:', e.message);
@@ -36,7 +45,6 @@ async function fetchTopPairs(n = TOP_N) {
   }
 }
 
-/** Remove trades older than the rolling window. */
 function cleanOldTrades() {
   const cutoff = Date.now() / 1000 - WINDOW_SECONDS;
   for (let [pair, trades] of whaleTrades) {
@@ -44,7 +52,6 @@ function cleanOldTrades() {
   }
 }
 
-/** Compute pressure score (-1 to +1) for each tracked pair. */
 function computeScores() {
   cleanOldTrades();
   const scores = new Map();
@@ -61,7 +68,6 @@ function computeScores() {
   return scores;
 }
 
-/** Build the combined Binance stream URL for given pairs. */
 function buildStreamUrl(pairs) {
   const streams = pairs.map(s => `${s.toLowerCase()}@trade`).join('/');
   return `wss://stream.binance.com:9443/stream?streams=${streams}`;
@@ -71,7 +77,6 @@ function buildStreamUrl(pairs) {
 
 function connectBinanceStream(pairs) {
   if (binanceWS) {
-    // Close previous connection before opening a new one
     binanceWS.close(1000, 'Refreshing pairs');
     binanceWS = null;
   }
@@ -86,33 +91,28 @@ function connectBinanceStream(pairs) {
   binanceWS.on('message', (data) => {
     try {
       const msg = JSON.parse(data);
-      // Each message: { stream: 'btcusdt@trade', data: { s, p, q, m, E, ... } }
       if (msg.data) {
         const trade = msg.data;
-        const pair = trade.s;            // e.g. 'BTCUSDT'
+        const pair = trade.s;
         const price = parseFloat(trade.p);
         const amount = parseFloat(trade.q);
         const notional = price * amount;
-        // Binance: 'm' = buyer is the maker? true → maker, so aggressive side is seller
         const side = trade.m ? 'sell' : 'buy';
 
         if (notional >= WHALE_THRESHOLD) {
           if (!whaleTrades.has(pair)) whaleTrades.set(pair, []);
           whaleTrades.get(pair).push({
-            time: trade.E / 1000,   // event time in seconds
+            time: trade.E / 1000,
             side,
             notional,
           });
         }
       }
-    } catch (e) {
-      // ignore malformed JSON
-    }
+    } catch (e) {}
   });
 
   binanceWS.on('close', (code, reason) => {
     console.log(`🔴 Binance disconnected – code: ${code}, reason: ${reason}`);
-    // Attempt to reconnect after 5 seconds (with the same pairs)
     binanceWS = null;
     setTimeout(() => {
       if (topPairs.length > 0) {
@@ -130,19 +130,20 @@ function connectBinanceStream(pairs) {
 // ── DYNAMIC PAIR REFRESH ─────────────────────────────────────
 async function refreshPairs() {
   const newPairs = await fetchTopPairs(TOP_N);
-  if (newPairs.length === 0) return;
+  if (newPairs.length === 0) {
+    console.warn('⚠️ Could not refresh pairs, keeping current list.');
+    return;
+  }
 
-  // If the list of pairs changed, reconnect with the new set
   if (JSON.stringify(newPairs) !== JSON.stringify(topPairs)) {
     console.log('🔄 Top pairs changed. Updating Binance stream…');
-    // Remove old trades for pairs no longer tracked
     for (let pair of whaleTrades.keys()) {
       if (!newPairs.includes(pair)) whaleTrades.delete(pair);
     }
     topPairs = newPairs;
     connectBinanceStream(topPairs);
   } else {
-    topPairs = newPairs;   // keep order up-to-date
+    topPairs = newPairs;
   }
 }
 
@@ -158,7 +159,6 @@ wss.on('connection', (ws) => {
   ws.send(JSON.stringify({ type: 'scores', data: Array.from(pairScores) }));
 });
 
-// Broadcast scores every 2 seconds
 setInterval(() => {
   pairScores = computeScores();
   const payload = JSON.stringify({ type: 'scores', data: Array.from(pairScores) });
@@ -167,16 +167,28 @@ setInterval(() => {
   });
 }, BROADCAST_INTERVAL_MS);
 
-// Periodic pair refresh
 setInterval(refreshPairs, REFRESH_INTERVAL_MS);
 
-// ── STARTUP ──────────────────────────────────────────────────
-(async () => {
-  topPairs = await fetchTopPairs(TOP_N);
-  if (topPairs.length === 0) {
-    console.error('❌ No pairs fetched. Exiting.');
-    process.exit(1);
+// ── STARTUP with retry ───────────────────────────────────────
+async function initPairs() {
+  let pairs = [];
+  let attempts = 0;
+  while (pairs.length === 0 && attempts < 10) {
+    pairs = await fetchTopPairs(TOP_N);
+    if (pairs.length === 0) {
+      console.log(`⏳ No pairs fetched, retrying in 5s (attempt ${attempts + 1}/10)...`);
+      await new Promise(r => setTimeout(r, 5000));
+    }
+    attempts++;
   }
+  if (pairs.length === 0) {
+    console.error('❌ Failed to get pairs after 10 attempts. Starting with empty list, will retry in background.');
+    // Don't exit – the refresh interval will eventually get pairs.
+    return;
+  }
+  topPairs = pairs;
   console.log('🏆 Top pairs:', topPairs.join(', '));
   connectBinanceStream(topPairs);
-})();
+}
+
+initPairs();

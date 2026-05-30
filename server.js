@@ -3,61 +3,32 @@ import fetch from 'node-fetch';
 import express from 'express';
 
 // ── CONFIG ───────────────────────────────────────────────────
-const WHALE_THRESHOLD = 20000;
-const WINDOW_SECONDS = 300;
-const TOP_N = 5;
-const REFRESH_INTERVAL_MS = 5 * 60_000;
-const BROADCAST_INTERVAL_MS = 2000;
+const WHALE_THRESHOLD = 20000;        // $20,000 notional
+const WINDOW_SECONDS = 300;           // 5‑min rolling window
+const TOP_N = 5;                      // 👈 now only 5 pairs
+const REFRESH_INTERVAL_MS = 5 * 60_000; // refresh ranking every 5 min
+const BROADCAST_INTERVAL_MS = 2000;   // push scores every 2 sec
 
 // ── STATE ────────────────────────────────────────────────────
-const whaleTrades = new Map();
-let topPairs = [];
+const whaleTrades = new Map();        // pair → [{time, side, notional}]
+let topPairs = [];                    // e.g. ["BTC/USDT","ETH/USDT",…]
 let pairScores = new Map();
-let bybitWS = null;
+let gateWS = null;
+let subscriptionChannels = [];
 
 // ── HELPERS ──────────────────────────────────────────────────
-
 async function fetchTopPairs(n = TOP_N) {
   try {
-    const res = await fetch('https://api.bybit.com/v5/market/tickers?category=spot', {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/json',
-      }
-    });
-
-    const text = await res.text();  // read raw text first
-
-    // Log status and first 500 chars of response for debugging
-    console.log(`📡 Bybit ticker HTTP ${res.status}: ${text.slice(0, 500)}`);
-
-    if (!res.ok) {
-      console.error(`❌ Bybit request failed with status ${res.status}`);
-      return [];
-    }
-
-    let json;
-    try {
-      json = JSON.parse(text);
-    } catch (e) {
-      console.error('❌ Failed to parse JSON:', e.message);
-      return [];
-    }
-
-    if (json.retCode !== 0 || !json.result?.list) {
-      console.error('❌ Bybit ticker error:', json.retMsg);
-      return [];
-    }
-
-    const usdt = json.result.list
-      .filter(t => t.symbol.endsWith('USDT'))
-      .sort((a, b) => parseFloat(b.turnover24h) - parseFloat(a.turnover24h))
+    const res = await fetch('https://api.gateio.ws/api/v4/spot/tickers');
+    const tickers = await res.json();
+    const usdtPairs = tickers
+      .filter(t => t.currency_pair.endsWith('_USDT'))
+      .sort((a, b) => parseFloat(b.quote_volume) - parseFloat(a.quote_volume))
       .slice(0, n)
-      .map(t => t.symbol);
-    return usdt;
-
+      .map(t => t.currency_pair.replace('_', '/'));
+    return usdtPairs;
   } catch (e) {
-    console.error('❌ fetchTopPairs exception:', e.message);
+    console.error('❌ fetchTopPairs error:', e);
     return [];
   }
 }
@@ -76,7 +47,7 @@ function computeScores() {
     const trades = whaleTrades.get(pair) || [];
     let buyVol = 0, sellVol = 0;
     for (let t of trades) {
-      if (t.side === 'Buy') buyVol += t.notional;
+      if (t.side === 'buy') buyVol += t.notional;
       else sellVol += t.notional;
     }
     const total = buyVol + sellVol;
@@ -85,85 +56,131 @@ function computeScores() {
   return scores;
 }
 
-// ── BYBIT WEBSOCKET ─────────────────────────────────────────
-function connectBybitStream(pairs) {
-  if (bybitWS) {
-    bybitWS.close(1000, 'Refreshing pairs');
-    bybitWS = null;
-  }
+// ── GATE.IO WEBSOCKET ───────────────────────────────────────
+function connectGateIO(channels) {
+  gateWS = new WebSocket('wss://ws.gate.io/v4/');
 
-  bybitWS = new WebSocket('wss://stream.bybit.com/v5/public/spot');
-
-  bybitWS.on('open', () => {
-    console.log('✅ Bybit WS open. Subscribing to trades...');
-    const args = pairs.map(p => `publicTrade.${p}`);
-    bybitWS.send(JSON.stringify({ op: 'subscribe', args }));
-    console.log(`📡 Subscribed to: ${args.join(', ')}`);
+  gateWS.on('open', () => {
+    console.log(`✅ Gate.io WS open. Subscribing after 500ms delay...`);
+    // 🚨 Delay to avoid immediate disconnect
+    setTimeout(() => {
+      gateWS.send(JSON.stringify({
+        time: Math.floor(Date.now() / 1000),
+        channel: 'spot.trades',
+        event: 'subscribe',
+        payload: channels
+      }));
+      console.log(`📡 Subscribed to: ${channels.join(', ')}`);
+    }, 1000);
   });
 
-  bybitWS.on('message', (data) => {
+  gateWS.on('message', (data) => {
+
     try {
       const msg = JSON.parse(data);
-      if (msg.topic && msg.topic.startsWith('publicTrade.') && msg.data) {
-        const pair = msg.topic.replace('publicTrade.', '');
-        const trades = msg.data;
-        for (let trade of trades) {
-          const price = parseFloat(trade.p);
-          const amount = parseFloat(trade.v);
-          const notional = price * amount;
-          const side = trade.S;
+      if (msg.channel === 'spot.trades' && msg.event === 'update') {
+          console.log('📥 Trade:', msg.result.currency_pair, msg.result.side, msg.result.price, msg.result.amount);
+      }
+      // 👀 Log subscription / unsubscribe responses
+      if (msg.event === 'subscribe') {
+        console.log('🔔 Subscription response:', JSON.stringify(msg).slice(0, 200));
+        return;
+      }
+      if (msg.event === 'unsubscribe') {
+        console.log('🔕 Unsubscribe response:', JSON.stringify(msg).slice(0, 200));
+        return;
+      }
 
-          if (notional >= WHALE_THRESHOLD) {
-            if (!whaleTrades.has(pair)) whaleTrades.set(pair, []);
-            whaleTrades.get(pair).push({
-              time: trade.T / 1000,
-              side,
-              notional,
-            });
-          }
+      // Process trades
+      if (msg.channel === 'spot.trades' && msg.event === 'update') {
+        const trade = msg.result;
+        const pair = trade.currency_pair.replace('_', '/');
+        const side = trade.side;
+        const price = parseFloat(trade.price);
+        const amount = parseFloat(trade.amount);
+        const notional = price * amount;
+
+        if (notional >= WHALE_THRESHOLD) {
+          if (!whaleTrades.has(pair)) whaleTrades.set(pair, []);
+          whaleTrades.get(pair).push({
+            time: trade.time,
+            side,
+            notional
+          });
         }
       }
-    } catch (e) {}
+    } catch (e) {
+      // ignore malformed JSON
+    }
   });
 
-  bybitWS.on('close', (code, reason) => {
-    console.log(`🔴 Bybit disconnected – code: ${code}, reason: ${reason}`);
-    bybitWS = null;
-    setTimeout(() => {
-      if (topPairs.length > 0) {
-        console.log('🔄 Reconnecting to Bybit…');
-        connectBybitStream(topPairs);
-      }
-    }, 5000);
+  gateWS.on('close', (code, reason) => {
+    console.log(`🔴 Disconnected – code: ${code}, reason: ${reason}`);
+    console.log('🔄 Reconnecting in 5s...');
+    setTimeout(() => connectGateIO(subscriptionChannels), 5000);
   });
 
-  bybitWS.on('error', (err) => console.error('🚨 Bybit WS error:', err.message));
+  gateWS.on('error', (err) => {
+    console.error('🚨 Gate WS error:', err.message);
+  });
 }
 
-// ── DYNAMIC PAIR REFRESH ─────────────────────────────────────
+// ── DYNAMIC SUBSCRIPTION UPDATE ─────────────────────────────
+function updateGateSubscription(newPairs) {
+  if (!gateWS || gateWS.readyState !== WebSocket.OPEN) return;
+
+  const newChannels = newPairs.map(p => p.replace('/', '_'));
+  const oldSet = new Set(subscriptionChannels);
+  const newSet = new Set(newChannels);
+
+  const toRemove = [...oldSet].filter(ch => !newSet.has(ch));
+  if (toRemove.length) {
+    gateWS.send(JSON.stringify({
+      time: Math.floor(Date.now() / 1000),
+      channel: 'spot.trades',
+      event: 'unsubscribe',
+      payload: toRemove
+    }));
+    console.log('🗑 Unsubscribed:', toRemove);
+  }
+
+  const toAdd = [...newSet].filter(ch => !oldSet.has(ch));
+  if (toAdd.length) {
+    gateWS.send(JSON.stringify({
+      time: Math.floor(Date.now() / 1000),
+      channel: 'spot.trades',
+      event: 'subscribe',
+      payload: toAdd
+    }));
+    console.log('➕ Subscribed:', toAdd);
+  }
+
+  subscriptionChannels = newChannels;
+}
+
+// ── RANKING REFRESH LOOP ─────────────────────────────────────
 async function refreshPairs() {
   const newPairs = await fetchTopPairs(TOP_N);
-  if (newPairs.length === 0) {
-    console.warn('⚠️ Could not refresh pairs, keeping current list.');
-    return;
-  }
+  if (newPairs.length === 0) return;
+
   if (JSON.stringify(newPairs) !== JSON.stringify(topPairs)) {
-    console.log('🔄 Top pairs changed. Updating Bybit stream…');
+    console.log('🔄 Top pairs changed. Updating subscriptions...');
+    topPairs = newPairs;
+    updateGateSubscription(topPairs);
+    // clear stale data
     for (let pair of whaleTrades.keys()) {
-      if (!newPairs.includes(pair)) whaleTrades.delete(pair);
+      if (!topPairs.includes(pair)) whaleTrades.delete(pair);
     }
-    topPairs = newPairs;
-    connectBybitStream(topPairs);
   } else {
-    topPairs = newPairs;
+    topPairs = newPairs; // keep order
   }
 }
 
 // ── EXPRESS + CLIENT WEBSOCKET ──────────────────────────────
 const app = express();
-const PORT = process.env.PORT || 4000;
+const PORT = 4000;
 app.get('/health', (_, res) => res.send('OK'));
-const server = app.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`));
+const server = app.listen(PORT, () => console.log(`🚀 Server on http://localhost:${PORT}`));
 
 const wss = new WebSocketServer({ server });
 wss.on('connection', (ws) => {
@@ -179,27 +196,16 @@ setInterval(() => {
   });
 }, BROADCAST_INTERVAL_MS);
 
-setInterval(refreshPairs, REFRESH_INTERVAL_MS);
-
 // ── STARTUP ──────────────────────────────────────────────────
-async function initPairs() {
-  let pairs = [];
-  let attempts = 0;
-  while (pairs.length === 0 && attempts < 10) {
-    pairs = await fetchTopPairs(TOP_N);
-    if (pairs.length === 0) {
-      console.log(`⏳ No pairs fetched, retrying in 5s (attempt ${attempts + 1}/10)...`);
-      await new Promise(r => setTimeout(r, 5000));
-    }
-    attempts++;
+(async () => {
+  topPairs = await fetchTopPairs(TOP_N);
+  if (topPairs.length === 0) {
+    console.error('❌ No pairs fetched. Exiting.');
+    process.exit(1);
   }
-  if (pairs.length === 0) {
-    console.error('❌ Could not get pairs after 10 attempts. Retrying in background.');
-    return;
-  }
-  topPairs = pairs;
-  console.log('🏆 Top pairs:', topPairs.join(', '));
-  connectBybitStream(topPairs);
-}
+  console.log('🏆 Top 5 pairs:', topPairs.join(', '));
+  subscriptionChannels = topPairs.map(p => p.replace('/', '_'));
+  connectGateIO(subscriptionChannels);
 
-initPairs();
+  setInterval(refreshPairs, REFRESH_INTERVAL_MS);
+})();

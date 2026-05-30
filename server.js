@@ -3,39 +3,61 @@ import fetch from 'node-fetch';
 import express from 'express';
 
 // ── CONFIG ───────────────────────────────────────────────────
-const WHALE_THRESHOLD = 20000;        // $20,000 notional
-const WINDOW_SECONDS = 300;           // 5‑min rolling window
-const TOP_N = 5;                      // number of pairs to track
-const REFRESH_INTERVAL_MS = 5 * 60_000; // refresh top pairs every 5 min
-const BROADCAST_INTERVAL_MS = 2000;   // push scores every 2 sec
+const WHALE_THRESHOLD = 20000;
+const WINDOW_SECONDS = 300;
+const TOP_N = 5;
+const REFRESH_INTERVAL_MS = 5 * 60_000;
+const BROADCAST_INTERVAL_MS = 2000;
 
 // ── STATE ────────────────────────────────────────────────────
-const whaleTrades = new Map();        // pair -> [{time, side, notional}]
-let topPairs = [];                    // e.g. ['BTCUSDT', 'ETHUSDT', …]
+const whaleTrades = new Map();
+let topPairs = [];
 let pairScores = new Map();
 let bybitWS = null;
 
 // ── HELPERS ──────────────────────────────────────────────────
 
-/** Fetch top USDT spot pairs by 24h turnover from Bybit (public) */
 async function fetchTopPairs(n = TOP_N) {
   try {
-    const res = await fetch('https://api.bybit.com/v5/market/tickers?category=spot');
-    const json = await res.json();
+    const res = await fetch('https://api.bybit.com/v5/market/tickers?category=spot', {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json',
+      }
+    });
+
+    const text = await res.text();  // read raw text first
+
+    // Log status and first 500 chars of response for debugging
+    console.log(`📡 Bybit ticker HTTP ${res.status}: ${text.slice(0, 500)}`);
+
+    if (!res.ok) {
+      console.error(`❌ Bybit request failed with status ${res.status}`);
+      return [];
+    }
+
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch (e) {
+      console.error('❌ Failed to parse JSON:', e.message);
+      return [];
+    }
+
     if (json.retCode !== 0 || !json.result?.list) {
       console.error('❌ Bybit ticker error:', json.retMsg);
       return [];
     }
-    const all = json.result.list;
-    // Filter USDT pairs, sort by turnover (quote volume)
-    const usdt = all
+
+    const usdt = json.result.list
       .filter(t => t.symbol.endsWith('USDT'))
       .sort((a, b) => parseFloat(b.turnover24h) - parseFloat(a.turnover24h))
       .slice(0, n)
-      .map(t => t.symbol);   // e.g. "BTCUSDT"
+      .map(t => t.symbol);
     return usdt;
+
   } catch (e) {
-    console.error('❌ fetchTopPairs error:', e.message);
+    console.error('❌ fetchTopPairs exception:', e.message);
     return [];
   }
 }
@@ -63,8 +85,7 @@ function computeScores() {
   return scores;
 }
 
-// ── BYBIT WEBSOCKET (public spot trades) ────────────────────
-
+// ── BYBIT WEBSOCKET ─────────────────────────────────────────
 function connectBybitStream(pairs) {
   if (bybitWS) {
     bybitWS.close(1000, 'Refreshing pairs');
@@ -75,7 +96,6 @@ function connectBybitStream(pairs) {
 
   bybitWS.on('open', () => {
     console.log('✅ Bybit WS open. Subscribing to trades...');
-    // Subscribe to each pair's trade channel
     const args = pairs.map(p => `publicTrade.${p}`);
     bybitWS.send(JSON.stringify({ op: 'subscribe', args }));
     console.log(`📡 Subscribed to: ${args.join(', ')}`);
@@ -84,7 +104,6 @@ function connectBybitStream(pairs) {
   bybitWS.on('message', (data) => {
     try {
       const msg = JSON.parse(data);
-      // Bybit trade message: { topic: "publicTrade.BTCUSDT", type: "snapshot"|"delta", data: [...] }
       if (msg.topic && msg.topic.startsWith('publicTrade.') && msg.data) {
         const pair = msg.topic.replace('publicTrade.', '');
         const trades = msg.data;
@@ -92,14 +111,13 @@ function connectBybitStream(pairs) {
           const price = parseFloat(trade.p);
           const amount = parseFloat(trade.v);
           const notional = price * amount;
-          // Bybit: S = "Buy" or "Sell" (aggressor side)
           const side = trade.S;
 
           if (notional >= WHALE_THRESHOLD) {
             if (!whaleTrades.has(pair)) whaleTrades.set(pair, []);
             whaleTrades.get(pair).push({
-              time: trade.T / 1000,   // trade time in ms → seconds
-              side,                    // "Buy" or "Sell"
+              time: trade.T / 1000,
+              side,
               notional,
             });
           }
@@ -129,7 +147,6 @@ async function refreshPairs() {
     console.warn('⚠️ Could not refresh pairs, keeping current list.');
     return;
   }
-
   if (JSON.stringify(newPairs) !== JSON.stringify(topPairs)) {
     console.log('🔄 Top pairs changed. Updating Bybit stream…');
     for (let pair of whaleTrades.keys()) {
@@ -164,7 +181,7 @@ setInterval(() => {
 
 setInterval(refreshPairs, REFRESH_INTERVAL_MS);
 
-// ── STARTUP with retry ───────────────────────────────────────
+// ── STARTUP ──────────────────────────────────────────────────
 async function initPairs() {
   let pairs = [];
   let attempts = 0;
